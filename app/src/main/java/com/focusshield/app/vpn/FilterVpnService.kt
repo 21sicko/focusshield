@@ -1,12 +1,12 @@
 package com.focusshield.app.vpn
 
-import android.content.Intent
-import android.net.VpnService
-import android.os.ParcelFileDescriptor
-import androidx.core.app.NotificationCompat
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Intent
+import android.net.VpnService
 import android.os.Build
+import android.os.ParcelFileDescriptor
+import androidx.core.app.NotificationCompat
 import com.focusshield.app.R
 import com.focusshield.app.data.BlocklistRepository
 import kotlinx.coroutines.CoroutineScope
@@ -15,21 +15,20 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.ByteBuffer
+import java.net.DatagramSocket
+import java.net.InetAddress
 
 /**
- * Local-only VpnService. This does NOT route traffic through any remote
- * server — it's purely a mechanism for intercepting DNS queries on-device
- * so they can be checked against the blocklist before being forwarded to
- * a real upstream DNS resolver. No traffic ever leaves the device through
- * a third party. This is the same approach apps like Gamban/NetNanny use.
+ * Local-only VpnService that intercepts DNS only — NOT all device
+ * traffic. The tun interface's route is scoped to just the virtual DNS
+ * server address (10.111.222.2), so Android sends DNS lookups through it
+ * but everything else (already-established connections, non-DNS traffic)
+ * flows normally outside the VPN. This keeps the implementation tractable
+ * (no need to build a full user-space NAT for arbitrary TCP/UDP traffic)
+ * while still controlling every plain DNS lookup the device makes.
  *
- * This is a simplified reference implementation of the packet loop: a
- * production build needs a proper IP/UDP/TCP parser (e.g. adapting the
- * approach from open-source projects like dns66 or AdAway's VPN module)
- * to parse DNS queries out of raw packets reliably. The structure below
- * is intentionally laid out so that parsing logic can be dropped into
- * handlePacket() without restructuring the service.
+ * Known limitation: DNS-over-HTTPS/TLS bypasses this since it isn't
+ * plain port-53 UDP — see DnsPacketProcessor's doc comment.
  */
 class FilterVpnService : VpnService() {
 
@@ -37,18 +36,27 @@ class FilterVpnService : VpnService() {
     private val job = Job()
     private val scope = CoroutineScope(Dispatchers.IO + job)
     private lateinit var blocklist: BlocklistRepository
+    private lateinit var processor: DnsPacketProcessor
 
     companion object {
         const val CHANNEL_ID = "focusshield_vpn"
         const val NOTIFICATION_ID = 1001
         const val ACTION_START = "com.focusshield.app.action.START_VPN"
         const val ACTION_STOP = "com.focusshield.app.action.STOP_VPN"
+        private const val VPN_ADDRESS = "10.111.222.1"
+        private const val DNS_ADDRESS = "10.111.222.2"
+        private const val UPSTREAM_DNS = "1.1.1.1" // Cloudflare; swap for any resolver you trust
     }
 
     override fun onCreate() {
         super.onCreate()
         blocklist = BlocklistRepository(applicationContext)
         blocklist.loadBlocklists()
+        processor = DnsPacketProcessor(
+            blocklist = blocklist,
+            protectSocket = { socket: DatagramSocket -> protect(socket) },
+            upstreamDns = InetAddress.getByName(UPSTREAM_DNS)
+        )
         createNotificationChannel()
     }
 
@@ -64,57 +72,67 @@ class FilterVpnService : VpnService() {
     }
 
     private fun startVpn() {
+        if (vpnInterface != null) return // already running
+
         startForeground(NOTIFICATION_ID, buildNotification())
 
         val builder = Builder()
             .setSession("FocusShield")
-            .addAddress("10.111.222.1", 32)
-            .addDnsServer("10.111.222.2") // virtual DNS server we intercept locally
-            .addRoute("0.0.0.0", 0)
+            .addAddress(VPN_ADDRESS, 32)
+            .addDnsServer(DNS_ADDRESS)
+            // Only route traffic destined for the virtual DNS server through
+            // the tun — NOT addRoute("0.0.0.0", 0). This is what keeps the
+            // implementation to "DNS filtering" rather than "full traffic
+            // proxy," and avoids needing to relay every app's general
+            // network traffic through user-space code.
+            .addRoute(DNS_ADDRESS, 32)
             .setBlocking(true)
 
-        vpnInterface = builder.establish()
-
-        scope.launch {
-            runPacketLoop()
+        vpnInterface = builder.establish() ?: run {
+            stopVpn()
+            return
         }
+
+        scope.launch { runPacketLoop() }
     }
 
     private fun runPacketLoop() {
         val iface = vpnInterface ?: return
         val input = FileInputStream(iface.fileDescriptor)
         val output = FileOutputStream(iface.fileDescriptor)
-        val buffer = ByteBuffer.allocate(32767)
+        val buffer = ByteArray(32767)
 
         while (vpnInterface != null) {
-            buffer.clear()
-            val length = input.read(buffer.array())
+            val length = try {
+                input.read(buffer)
+            } catch (e: Exception) {
+                break
+            }
             if (length <= 0) continue
-            buffer.limit(length)
 
-            // handlePacket parses the packet, extracts any embedded DNS
-            // query, checks the queried hostname against blocklist, and
-            // either forwards it to a real upstream resolver (allowed)
-            // or returns NXDOMAIN / a blocked-page response (blocked).
-            handlePacket(buffer, output, blocklist)
+            val response = try {
+                processor.process(buffer, length)
+            } catch (e: Exception) {
+                null
+            }
+
+            if (response != null) {
+                try {
+                    output.write(response)
+                } catch (e: Exception) {
+                    // tun closed mid-write; loop condition will exit next pass
+                }
+            }
         }
-    }
-
-    private fun handlePacket(
-        buffer: ByteBuffer,
-        output: FileOutputStream,
-        blocklist: BlocklistRepository
-    ) {
-        // Placeholder for full IP/UDP/DNS parsing — see class doc comment.
-        // Real implementation forwards non-DNS traffic untouched, and for
-        // DNS queries: extracts hostname, calls blocklist.isBlocked(host),
-        // and either proxies to upstream DNS or synthesizes a block
-        // response.
     }
 
     private fun stopVpn() {
         job.cancel()
-        vpnInterface?.close()
+        try {
+            vpnInterface?.close()
+        } catch (e: Exception) {
+            // already closed
+        }
         vpnInterface = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -126,9 +144,9 @@ class FilterVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        // Called if the user revokes VPN permission from system Settings.
-        // Device Owner's DISALLOW_CONFIG_VPN restriction prevents this
-        // path when active; this is the fallback for non-Device-Owner mode.
+        // Fallback path if VPN permission is revoked from Settings — only
+        // reachable when not running under Device Owner's
+        // DISALLOW_CONFIG_VPN restriction.
         stopVpn()
         super.onRevoke()
     }

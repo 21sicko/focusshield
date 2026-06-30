@@ -29,6 +29,10 @@ class MainActivity : AppCompatActivity() {
             requestVpnPermissionAndStart()
         }
 
+        findViewById<android.widget.Button>(R.id.btnSetPin)?.setOnClickListener {
+            PinDialogHelper.showSetupDialog(this, com.focusshield.app.data.CooldownManager(this))
+        }
+
         findViewById<android.widget.Button>(R.id.btnRequestDisable)?.setOnClickListener {
             startActivity(Intent(this, DisableRequestActivity::class.java))
         }

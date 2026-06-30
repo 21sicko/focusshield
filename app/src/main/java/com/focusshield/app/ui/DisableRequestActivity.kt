@@ -60,10 +60,9 @@ class DisableRequestActivity : AppCompatActivity() {
     }
 
     private fun promptForTrustedPin() {
-        // In a full implementation this opens a PIN entry dialog and calls
-        // cooldownManager.verifyTrustedContactPin(pin) before proceeding.
-        // Left as a hook here since the PIN holder/UI flow is something
-        // you'd want to customize (e.g. who the trusted contact is).
+        PinDialogHelper.showVerifyDialog(this, cooldownManager) {
+            finalizeDisable()
+        }
     }
 
     private fun finalizeDisable() {
