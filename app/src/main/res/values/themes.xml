@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.FocusShield" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#2E5EAA</item>
+        <item name="colorPrimaryDark">#1A3D7A</item>
+        <item name="colorAccent">#2E5EAA</item>
+    </style>
+</resources>

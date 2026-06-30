@@ -1,0 +1,14 @@
+# FocusShield adult-content blocklist
+#
+# Starter list only. Replace with the "gambling-and-porn" or "fakenews-
+# gambling-porn" variant from Steven Black's unified hosts project for
+# comprehensive, regularly updated coverage:
+#
+#   https://github.com/StevenBlack/hosts
+#
+# Same format: one bare domain per line, no IP prefix.
+#
+pornhub.com
+xvideos.com
+xnxx.com
+xhamster.com

@@ -1,0 +1,21 @@
+# FocusShield gambling blocklist
+#
+# This is a small starter list. Replace this file with a full,
+# up-to-date list before relying on the app — for example, the
+# gambling-hosts category from Steven Black's unified hosts project
+# (community-maintained, free, MIT-licensed):
+#
+#   https://github.com/StevenBlack/hosts
+#
+# To update: download the "gambling" variant hosts file, strip the
+# "0.0.0.0 " / "127.0.0.1 " prefixes so only the bare domain remains
+# on each line, and replace the contents below. One domain per line.
+#
+bet365.com
+betway.com
+williamhill.com
+1xbet.com
+draftkings.com
+fanduel.com
+pokerstars.com
+betfair.com
