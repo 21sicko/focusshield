@@ -17,18 +17,26 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.Socket
 
 /**
- * Local-only VpnService that intercepts DNS only — NOT all device
- * traffic. The tun interface's route is scoped to just the virtual DNS
- * server address (10.111.222.2), so Android sends DNS lookups through it
- * but everything else (already-established connections, non-DNS traffic)
- * flows normally outside the VPN. This keeps the implementation tractable
- * (no need to build a full user-space NAT for arbitrary TCP/UDP traffic)
- * while still controlling every plain DNS lookup the device makes.
+ * Full-traffic VpnService. Routes ALL device traffic through the tun
+ * (0.0.0.0/1 + 128.0.0.0/1, the standard "default route" split that
+ * avoids some OEM edge cases with a single 0.0.0.0/0 route) so that
+ * Android's "Block connections without VPN" kill switch can be used for
+ * tamper resistance without taking down the whole connection.
  *
- * Known limitation: DNS-over-HTTPS/TLS bypasses this since it isn't
- * plain port-53 UDP — see DnsPacketProcessor's doc comment.
+ * Every packet is demuxed by protocol:
+ *  - UDP port 53           -> DnsPacketProcessor (blocklist-aware, can
+ *                              reply locally with NXDOMAIN)
+ *  - any other UDP         -> UdpRelay (generic NAT relay over a real,
+ *                              protected DatagramSocket per session)
+ *  - TCP                   -> TcpRelay (userspace TCP splice over a real,
+ *                              protected Socket per session)
+ *  - anything else (ICMP etc.) -> dropped
+ *
+ * Known limitation: this is NOT a production-grade TCP/IP stack. See
+ * TcpRelay's doc comment for what it deliberately does not implement.
  */
 class FilterVpnService : VpnService() {
 
@@ -36,7 +44,12 @@ class FilterVpnService : VpnService() {
     private val job = Job()
     private val scope = CoroutineScope(Dispatchers.IO + job)
     private lateinit var blocklist: BlocklistRepository
-    private lateinit var processor: DnsPacketProcessor
+    private lateinit var dnsProcessor: DnsPacketProcessor
+    private lateinit var udpRelay: UdpRelay
+    private lateinit var tcpRelay: TcpRelay
+
+    private var tunOutput: FileOutputStream? = null
+    private val writeLock = Any()
 
     companion object {
         const val CHANNEL_ID = "focusshield_vpn"
@@ -52,11 +65,21 @@ class FilterVpnService : VpnService() {
         super.onCreate()
         blocklist = BlocklistRepository(applicationContext)
         blocklist.loadBlocklists()
-        processor = DnsPacketProcessor(
+
+        dnsProcessor = DnsPacketProcessor(
             blocklist = blocklist,
             protectSocket = { socket: DatagramSocket -> protect(socket) },
             upstreamDns = InetAddress.getByName(UPSTREAM_DNS)
         )
+        udpRelay = UdpRelay(
+            protectSocket = { socket: DatagramSocket -> protect(socket) },
+            writeToTun = { packet -> writeToTun(packet) }
+        )
+        tcpRelay = TcpRelay(
+            protectSocket = { socket: Socket -> protect(socket) },
+            writeToTun = { packet -> writeToTun(packet) }
+        )
+
         createNotificationChannel()
     }
 
@@ -80,26 +103,28 @@ class FilterVpnService : VpnService() {
             .setSession("FocusShield")
             .addAddress(VPN_ADDRESS, 32)
             .addDnsServer(DNS_ADDRESS)
-            // Only route traffic destined for the virtual DNS server through
-            // the tun — NOT addRoute("0.0.0.0", 0). This is what keeps the
-            // implementation to "DNS filtering" rather than "full traffic
-            // proxy," and avoids needing to relay every app's general
-            // network traffic through user-space code.
-            .addRoute(DNS_ADDRESS, 32)
+            // Full default-route split. Everything goes through the tun now,
+            // not just DNS - that's the whole point of this version: it lets
+            // the system "Block connections without VPN" switch work without
+            // killing all traffic, because now all traffic legitimately is
+            // VPN traffic.
+            .addRoute("0.0.0.0", 1)
+            .addRoute("128.0.0.0", 1)
             .setBlocking(true)
+            .setMtu(1500)
 
         vpnInterface = builder.establish() ?: run {
             stopVpn()
             return
         }
 
+        tunOutput = FileOutputStream(vpnInterface!!.fileDescriptor)
         scope.launch { runPacketLoop() }
     }
 
     private fun runPacketLoop() {
         val iface = vpnInterface ?: return
         val input = FileInputStream(iface.fileDescriptor)
-        val output = FileOutputStream(iface.fileDescriptor)
         val buffer = ByteArray(32767)
 
         while (vpnInterface != null) {
@@ -110,30 +135,76 @@ class FilterVpnService : VpnService() {
             }
             if (length <= 0) continue
 
-            val response = try {
-                processor.process(buffer, length)
+            try {
+                demux(buffer, length)
             } catch (e: Exception) {
-                null
+                // malformed/unsupported packet - drop and keep going
             }
+        }
+    }
 
-            if (response != null) {
-                try {
-                    output.write(response)
-                } catch (e: Exception) {
-                    // tun closed mid-write; loop condition will exit next pass
+    /** Looks at the IP header to decide which handler owns this packet. */
+    private fun demux(buffer: ByteArray, length: Int) {
+        if (length < 20) return
+        val ipVersion = (buffer[0].toInt() shr 4) and 0xF
+        if (ipVersion != 4) return // IPv6 not handled in this minimal version
+
+        val protocol = buffer[9].toInt() and 0xFF
+        when (protocol) {
+            17 -> { // UDP
+                val ihl = (buffer[0].toInt() and 0xF) * 4
+                val dstPort = ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or (buffer[ihl + 3].toInt() and 0xFF)
+                if (dstPort == 53) {
+                    val response = dnsProcessor.process(buffer, length)
+                    if (response != null) writeToTun(response)
+                } else {
+                    routeUdpToRelay(buffer, length, ihl)
                 }
+            }
+            6 -> { // TCP
+                tcpRelay.handle(buffer.copyOf(length), length)
+            }
+            else -> {
+                // ICMP and anything else: not relayed in this minimal version.
+            }
+        }
+    }
+
+    private fun routeUdpToRelay(buffer: ByteArray, length: Int, ihl: Int) {
+        val srcIp = buffer.copyOfRange(12, 16)
+        val dstIp = buffer.copyOfRange(16, 20)
+        val srcPort = ((buffer[ihl].toInt() and 0xFF) shl 8) or (buffer[ihl + 1].toInt() and 0xFF)
+        val dstPort = ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or (buffer[ihl + 3].toInt() and 0xFF)
+        val udpLength = ((buffer[ihl + 4].toInt() and 0xFF) shl 8) or (buffer[ihl + 5].toInt() and 0xFF)
+        val payloadStart = ihl + 8
+        val payloadLength = udpLength - 8
+        if (payloadLength <= 0 || payloadStart + payloadLength > length) return
+        val payload = buffer.copyOfRange(payloadStart, payloadStart + payloadLength)
+        udpRelay.handle(srcIp, srcPort, dstIp, dstPort, payload)
+    }
+
+    /** All reply paths (main loop, UDP relay reader threads, TCP relay reader threads) funnel through here. */
+    private fun writeToTun(packet: ByteArray) {
+        synchronized(writeLock) {
+            try {
+                tunOutput?.write(packet)
+            } catch (e: Exception) {
+                // tun closed mid-write; safe to ignore, loop/session will exit
             }
         }
     }
 
     private fun stopVpn() {
         job.cancel()
+        udpRelay.closeAll()
+        tcpRelay.closeAll()
         try {
             vpnInterface?.close()
         } catch (e: Exception) {
             // already closed
         }
         vpnInterface = null
+        tunOutput = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
