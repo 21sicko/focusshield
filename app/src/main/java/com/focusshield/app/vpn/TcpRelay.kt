@@ -5,31 +5,23 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 import kotlin.random.Random
 
-/**
- * Minimal userspace TCP relay ("splicer"). For each new device-initiated
- * connection it opens a real, protected Socket to the destination and
- * mirrors bytes between the two sides, faking the TCP wire protocol
- * (sequence/ack numbers, handshake, FIN/RST) on the device-facing side.
- *
- * Deliberately NOT a full RFC 793 implementation: no retransmission of our
- * own segments, no out-of-order reassembly, no window scaling/congestion
- * control. Loss on the device<->relay leg should be ~0 since it's local
- * to the phone; loss on the relay<->internet leg is already handled by
- * the real Socket's own TCP stack before we ever see the bytes. This is
- * the same simplifying assumption small hand-rolled VPN relays generally
- * make - it's enough for normal browsing/app traffic, but it isn't a
- * substitute for a real TCP/IP stack (e.g. lwIP) if avg. packet loss
- * between the relay and the device side ever shows up in testing.
- */
 class TcpRelay(
     private val protectSocket: (Socket) -> Boolean,
     private val writeToTun: (ByteArray) -> Unit
 ) {
     private data class SessionKey(val srcPort: Int, val dstIp: String, val dstPort: Int)
-
     private enum class State { SYN_RECEIVED, ESTABLISHED, CLOSING, CLOSED }
+
+    // Caps how many real sockets can be mid-connect at once. Without this,
+    // a burst of traffic (many apps at once) opens hundreds of raw threads
+    // simultaneously, which can starve/race the VpnService.protect() call
+    // and cause sockets to silently stay inside the tunnel instead of
+    // being exempted from it - producing exactly the "everything times
+    // out" symptom.
+    private val connectionLimiter = Semaphore(150)
 
     private inner class Session(
         val deviceIp: ByteArray, val destIp: ByteArray,
@@ -37,8 +29,8 @@ class TcpRelay(
         val clientIsn: Long
     ) {
         val ourIsn: Long = Random.nextLong(0, 0xFFFFFFFFL)
-        var bytesFromClient: Long = 0   // payload bytes relayed device -> real socket
-        var bytesToClient: Long = 0     // payload bytes relayed real socket -> device
+        var bytesFromClient: Long = 0
+        var bytesToClient: Long = 0
         @Volatile var state: State = State.SYN_RECEIVED
         var socket: Socket? = null
         var output: OutputStream? = null
@@ -51,7 +43,7 @@ class TcpRelay(
     private val sessions = ConcurrentHashMap<SessionKey, Session>()
 
     fun handle(packet: ByteArray, length: Int) {
-        if (length < 40) return // shorter than minimum IPv4(20) + TCP(20) header
+        if (length < 40) return
         val ihl = (packet[0].toInt() and 0x0F) * 4
         val tcpStart = ihl
         if (tcpStart + 20 > length) return
@@ -61,7 +53,6 @@ class TcpRelay(
         val srcPort = u16(packet, tcpStart)
         val dstPort = u16(packet, tcpStart + 2)
         val seq = u32(packet, tcpStart + 4)
-        val ackNum = u32(packet, tcpStart + 8)
         val dataOffset = ((packet[tcpStart + 12].toInt() and 0xFF) shr 4) * 4
         val flags = packet[tcpStart + 13].toInt() and 0xFF
         val payloadStart = tcpStart + dataOffset
@@ -72,9 +63,13 @@ class TcpRelay(
 
         when {
             flags and TcpFlags.SYN != 0 && flags and TcpFlags.ACK == 0 -> {
-                // New connection request.
+                if (sessions.containsKey(key)) {
+                    // Duplicate/retransmitted SYN for an already-pending session - ignore it
+                    // instead of tearing down and reopening, which was likely amplifying the
+                    // connection storm under load.
+                    return
+                }
                 DebugLog.log("SYN new connection -> $dstIpStr:$dstPort (srcPort=$srcPort)")
-                if (sessions.containsKey(key)) sessions.remove(key)?.socket?.close()
                 val session = Session(srcIp, dstIp, srcPort, dstPort, seq)
                 sessions[key] = session
                 openRealSocket(key, session, dstIpStr, dstPort)
@@ -87,7 +82,7 @@ class TcpRelay(
                 session.lastActive = System.currentTimeMillis()
 
                 if (flags and TcpFlags.FIN != 0) {
-                    session.bytesFromClient += 1 // FIN consumes a sequence number
+                    session.bytesFromClient += 1
                     try { session.output?.flush(); session.socket?.shutdownOutput() } catch (e: Exception) {}
                     sendSegment(session, TcpFlags.ACK, ByteArray(0))
                     session.state = State.CLOSING
@@ -107,19 +102,35 @@ class TcpRelay(
 
     private fun openRealSocket(key: SessionKey, session: Session, dstIpStr: String, dstPort: Int) {
         Thread {
+            val gotPermit = connectionLimiter.tryAcquire(8, java.util.concurrent.TimeUnit.SECONDS)
+            if (!gotPermit) {
+                DebugLog.log("REJECTED $dstIpStr:$dstPort - too many concurrent connections")
+                sendSegment(session, TcpFlags.RST or TcpFlags.ACK, ByteArray(0))
+                sessions.remove(key)
+                return@Thread
+            }
             try {
                 val socket = Socket()
-                protectSocket(socket)
+                // Force the underlying native fd to exist before protect() -
+                // an unbound Socket may not have one yet on some Android
+                // versions, which makes protect() silently no-op.
+                socket.bind(InetSocketAddress(0))
+                val protected = protectSocket(socket)
+                DebugLog.log("protect() returned $protected for $dstIpStr:$dstPort")
+                if (!protected) {
+                    DebugLog.log("PROTECT FAILED for $dstIpStr:$dstPort - aborting connection")
+                    sendSegment(session, TcpFlags.RST or TcpFlags.ACK, ByteArray(0))
+                    sessions.remove(key)
+                    socket.close()
+                    return@Thread
+                }
+
                 DebugLog.log("opening real socket to $dstIpStr:$dstPort")
-                socket.connect(InetSocketAddress(dstIpStr, dstPort), 10_000)
-                DebugLog.log("connected to $dstIpStr:$dstPort")
+                socket.connect(InetSocketAddress(dstIpStr, dstPort), 8_000)
+                DebugLog.log("connected to $dstIpStr:$dstPort, local=${socket.localAddress}")
                 session.socket = socket
                 session.output = socket.outputStream
 
-                // Handshake: SYN-ACK now that the real connection is up.
-                // (seqToSend() already bakes in "ourIsn + 1" as the baseline,
-                // so our own SYN's sequence-number consumption needs no
-                // separate increment here.)
                 sendSegment(session, TcpFlags.SYN or TcpFlags.ACK, ByteArray(0))
                 session.state = State.ESTABLISHED
 
@@ -128,6 +139,8 @@ class TcpRelay(
                 DebugLog.log("FAILED to connect to $dstIpStr:$dstPort - ${e.message}")
                 sendSegment(session, TcpFlags.RST or TcpFlags.ACK, ByteArray(0))
                 sessions.remove(key)
+            } finally {
+                connectionLimiter.release()
             }
         }.apply { isDaemon = true }.start()
     }
@@ -140,7 +153,7 @@ class TcpRelay(
                     val n = input.read(buf)
                     if (n < 0) {
                         sendSegment(session, TcpFlags.FIN or TcpFlags.ACK, ByteArray(0))
-                        session.bytesToClient += 1 // FIN consumes a sequence number
+                        session.bytesToClient += 1
                         break
                     }
                     if (n > 0) {
@@ -151,7 +164,6 @@ class TcpRelay(
                     session.lastActive = System.currentTimeMillis()
                 }
             } catch (e: Exception) {
-                // upstream closed/errored - fall through to cleanup
             } finally {
                 sessions.remove(key)
                 try { session.socket?.close() } catch (e: Exception) {}
