@@ -12,7 +12,7 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@drawable/ic_shield"
         android:label="FocusShield"
         android:theme="@style/Theme.FocusShield">
 
