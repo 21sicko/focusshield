@@ -73,6 +73,7 @@ class TcpRelay(
         when {
             flags and TcpFlags.SYN != 0 && flags and TcpFlags.ACK == 0 -> {
                 // New connection request.
+                DebugLog.log("SYN new connection -> $dstIpStr:$dstPort (srcPort=$srcPort)")
                 if (sessions.containsKey(key)) sessions.remove(key)?.socket?.close()
                 val session = Session(srcIp, dstIp, srcPort, dstPort, seq)
                 sessions[key] = session
@@ -109,7 +110,9 @@ class TcpRelay(
             try {
                 val socket = Socket()
                 protectSocket(socket)
+                DebugLog.log("opening real socket to $dstIpStr:$dstPort")
                 socket.connect(InetSocketAddress(dstIpStr, dstPort), 10_000)
+                DebugLog.log("connected to $dstIpStr:$dstPort")
                 session.socket = socket
                 session.output = socket.outputStream
 
@@ -122,6 +125,7 @@ class TcpRelay(
 
                 startUpstreamReader(key, session, socket.inputStream)
             } catch (e: Exception) {
+                DebugLog.log("FAILED to connect to $dstIpStr:$dstPort - ${e.message}")
                 sendSegment(session, TcpFlags.RST or TcpFlags.ACK, ByteArray(0))
                 sessions.remove(key)
             }

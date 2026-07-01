@@ -95,6 +95,7 @@ class FilterVpnService : VpnService() {
     }
 
     private fun startVpn() {
+        com.focusshield.app.vpn.DebugLog.start(applicationContext)
         if (vpnInterface != null) return // already running
 
         startForeground(NOTIFICATION_ID, buildNotification())
