@@ -15,12 +15,6 @@ class TcpRelay(
     private data class SessionKey(val srcPort: Int, val dstIp: String, val dstPort: Int)
     private enum class State { SYN_RECEIVED, ESTABLISHED, CLOSING, CLOSED }
 
-    // Caps how many real sockets can be mid-connect at once. Without this,
-    // a burst of traffic (many apps at once) opens hundreds of raw threads
-    // simultaneously, which can starve/race the VpnService.protect() call
-    // and cause sockets to silently stay inside the tunnel instead of
-    // being exempted from it - producing exactly the "everything times
-    // out" symptom.
     private val connectionLimiter = Semaphore(150)
 
     private inner class Session(
@@ -63,12 +57,7 @@ class TcpRelay(
 
         when {
             flags and TcpFlags.SYN != 0 && flags and TcpFlags.ACK == 0 -> {
-                if (sessions.containsKey(key)) {
-                    // Duplicate/retransmitted SYN for an already-pending session - ignore it
-                    // instead of tearing down and reopening, which was likely amplifying the
-                    // connection storm under load.
-                    return
-                }
+                if (sessions.containsKey(key)) return
                 DebugLog.log("SYN new connection -> $dstIpStr:$dstPort (srcPort=$srcPort)")
                 val session = Session(srcIp, dstIp, srcPort, dstPort, seq)
                 sessions[key] = session
@@ -82,18 +71,28 @@ class TcpRelay(
                 session.lastActive = System.currentTimeMillis()
 
                 if (flags and TcpFlags.FIN != 0) {
-                    session.bytesFromClient += 1
-                    try { session.output?.flush(); session.socket?.shutdownOutput() } catch (e: Exception) {}
-                    sendSegment(session, TcpFlags.ACK, ByteArray(0))
-                    session.state = State.CLOSING
-                } else if (payload.isNotEmpty() && session.state != State.CLOSED) {
-                    try {
-                        session.output?.write(payload)
-                        session.bytesFromClient += payload.size
+                    if (seq == session.ackToSend()) {
+                        session.bytesFromClient += 1
+                        try { session.output?.flush(); session.socket?.shutdownOutput() } catch (e: Exception) {}
                         sendSegment(session, TcpFlags.ACK, ByteArray(0))
-                    } catch (e: Exception) {
-                        sendSegment(session, TcpFlags.RST or TcpFlags.ACK, ByteArray(0))
-                        sessions.remove(key)?.socket?.close()
+                        session.state = State.CLOSING
+                    } else {
+                        sendSegment(session, TcpFlags.ACK, ByteArray(0))
+                    }
+                } else if (payload.isNotEmpty() && session.state != State.CLOSED) {
+                    val expected = session.ackToSend()
+                    if (seq == expected) {
+                        try {
+                            session.output?.write(payload)
+                            session.bytesFromClient += payload.size
+                            sendSegment(session, TcpFlags.ACK, ByteArray(0))
+                        } catch (e: Exception) {
+                            sendSegment(session, TcpFlags.RST or TcpFlags.ACK, ByteArray(0))
+                            sessions.remove(key)?.socket?.close()
+                        }
+                    } else {
+                        DebugLog.log("out-of-order/dup segment on $dstIpStr:$dstPort (got seq=$seq, expected=$expected) - dropped, re-ACKed")
+                        sendSegment(session, TcpFlags.ACK, ByteArray(0))
                     }
                 }
             }
@@ -111,12 +110,8 @@ class TcpRelay(
             }
             try {
                 val socket = Socket()
-                // Force the underlying native fd to exist before protect() -
-                // an unbound Socket may not have one yet on some Android
-                // versions, which makes protect() silently no-op.
                 socket.bind(InetSocketAddress(0))
                 val protected = protectSocket(socket)
-                DebugLog.log("protect() returned $protected for $dstIpStr:$dstPort")
                 if (!protected) {
                     DebugLog.log("PROTECT FAILED for $dstIpStr:$dstPort - aborting connection")
                     sendSegment(session, TcpFlags.RST or TcpFlags.ACK, ByteArray(0))
@@ -125,9 +120,7 @@ class TcpRelay(
                     return@Thread
                 }
 
-                DebugLog.log("opening real socket to $dstIpStr:$dstPort")
                 socket.connect(InetSocketAddress(dstIpStr, dstPort), 8_000)
-                DebugLog.log("connected to $dstIpStr:$dstPort, local=${socket.localAddress}")
                 session.socket = socket
                 session.output = socket.outputStream
 
